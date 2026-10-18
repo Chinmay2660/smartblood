@@ -136,20 +136,41 @@ def twilio_calls_enabled():
         sid and (has_api_auth or has_token_auth) and number and (has_webhooks or has_trial_voice)
     )
 
+def twilio_call_error_detail(exc):
+    """Short, actionable message for alert history (raw Twilio errors are long)."""
+    raw = str(exc)
+    lower = raw.lower()
+    if "verified recipient" in lower or "trial phone number is assigned" in lower:
+        return (
+            "Twilio trial: this hospital’s number is not a verified recipient. "
+            "In Twilio Console → Phone Numbers → Verified Caller IDs, add it in E.164 (e.g. +91…), then alert again."
+        )[:255]
+    if "limited parameter access" in lower or "disallowed parameters" in lower:
+        hint = (
+            "Set TWILIO_USE_TRIAL_VOICE=1 in .env to use Twilio’s trial voice template, "
+            "or upgrade the account to use this app’s /voice blood-request script."
+        )
+        if not twilio_trial_voice_url():
+            return f"Twilio trial blocked call parameters. {hint}"[:255]
+        return (
+            "Twilio trial blocked this call. Verify the recipient number and call within your trial region."
+        )[:255]
+    return raw[:255]
+
 def place_outbound_call(client, to, from_, voice_url, public_url):
-    """Trial accounts reject Method / StatusCallbackMethod on Calls.create."""
+    """Trial accounts reject extra Call.create params and often reject custom voice URLs."""
     minimal = {"to": to, "from_": from_, "url": voice_url}
     if voice_url.startswith("https://webhooks.twilio.com/"):
         return client.calls.create(**minimal)
-    with_status = {**minimal, "status_callback": f"{public_url}/call-status"}
+    # ponytail: trial usually fails on status_callback — try minimal first, then full webhook on paid accounts
     try:
-        return client.calls.create(**with_status)
+        return client.calls.create(**minimal)
     except Exception as exc:
         msg = str(exc).lower()
         if "limited parameter access" not in msg and "disallowed parameters" not in msg:
             raise
-        # ponytail: trial allows To, Url, optional StatusCallback — retry bare minimum
-        return client.calls.create(**minimal)
+        with_status = {**minimal, "status_callback": f"{public_url}/call-status"}
+        return client.calls.create(**with_status)
 
 def twilio_request_is_valid():
     """Validate X-Twilio-Signature when Auth Token is configured."""
@@ -347,13 +368,7 @@ def alert_hospitals(request_id):
             ))
             called = True
         except Exception as exc:
-            detail = str(exc)[:220]
-            if "limited parameter access" in detail.lower():
-                detail = (
-                    "Twilio trial blocked this call. Verify recipient numbers in Twilio, "
-                    "call within your trial country, or upgrade the account. "
-                    f"({detail[:120]})"
-                )
+            detail = twilio_call_error_detail(exc)
             db.session.add(
                 AlertLog(
                     request_id=blood_request.id,
