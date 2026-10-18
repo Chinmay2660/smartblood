@@ -35,7 +35,7 @@
     <header class="topbar">
       <div class="mobile-brand">✚ SmartBloodLink</div>
       <div class="breadcrumb">Workspace <span>/</span> <strong>Overview</strong></div>
-      <div class="top-actions"><span class="status-dot"></span><span class="system-status">{% if trial_voice_mode %}Twilio trial template calls (verified numbers only){% elif real_calls_enabled %}Twilio ready — calls only to verified hospitals{% else %}Demo mode — no live calls{% endif %}</span><button class="icon-button" title="Notifications">♧<i></i></button><div class="avatar small">SB</div></div>
+      <div class="top-actions"><span class="status-dot"></span><span class="system-status">{% if trial_script_mode %}Twilio trial — blood-request voice script{% elif trial_voice_mode %}Twilio trial — Console demo template{% elif real_calls_enabled %}Twilio ready — full voice with keypad{% else %}Demo mode — no live calls{% endif %}</span><button class="icon-button" title="Notifications">♧<i></i></button><div class="avatar small">SB</div></div>
     </header>
 
     <section class="page-heading" id="overview">

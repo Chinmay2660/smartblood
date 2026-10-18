@@ -134,21 +134,54 @@ TWILIO_TRIAL_VOICE_TEMPLATE = (
     "https://webhooks.twilio.com/v1/Voice/Template/voice_speech_recognition"
 )
 
+def twilio_use_trial_voice_flag():
+    return os.getenv("TWILIO_USE_TRIAL_VOICE", "").strip().lower() in ("1", "true", "yes")
+
+def twilio_trial_script_enabled():
+    """Inline TwiML blood-request message (default when TWILIO_USE_TRIAL_VOICE=1)."""
+    if not twilio_use_trial_voice_flag():
+        return False
+    script_flag = os.getenv("TWILIO_TRIAL_SCRIPT", "").strip().lower()
+    if script_flag in ("0", "false", "no"):
+        return False
+    explicit_url = os.getenv("TWILIO_TRIAL_VOICE_URL", "").strip()
+    if explicit_url and script_flag not in ("1", "true", "yes"):
+        return False
+    return True
+
 def twilio_trial_voice_url():
-    """When set, outbound calls use Twilio’s trial template URL instead of /voice/…"""
+    """Twilio-hosted demo URL when trial mode is on but inline script is off."""
+    if not twilio_use_trial_voice_flag() or twilio_trial_script_enabled():
+        return ""
     explicit = os.getenv("TWILIO_TRIAL_VOICE_URL", "").strip()
     if explicit:
         return explicit
-    flag = os.getenv("TWILIO_USE_TRIAL_VOICE", "").strip().lower()
-    if flag in ("1", "true", "yes"):
-        return TWILIO_TRIAL_VOICE_TEMPLATE
-    return ""
+    return TWILIO_TRIAL_VOICE_TEMPLATE
 
 def twilio_outbound_voice_url(request_id, hospital_id, public_url):
     trial = twilio_trial_voice_url()
     if trial:
         return trial
     return f"{public_url}/voice/{request_id}/{hospital_id}"
+
+def blood_request_voice_intro(blood_request, hospital, include_keypad=True):
+    intro = (
+        f"Hello {hospital.name}. This is Smart BloodLink with an urgent blood request. "
+        f"We need {blood_request.units} units of {blood_request.blood_group} blood in {blood_request.city}. "
+        f"Requester contact number is {blood_request.contact_phone}."
+    )
+    if include_keypad:
+        return intro + " If you can supply this blood, press 1. If not available, press 2."
+    return intro + " Please check availability and contact the requester. Goodbye."
+
+def build_trial_alert_twiml(blood_request, hospital):
+    from xml.sax.saxutils import escape
+    spoken = blood_request_voice_intro(blood_request, hospital, include_keypad=False)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?><Response>'
+        f'<Say voice="alice">{escape(spoken)}</Say>'
+        "</Response>"
+    )
 
 def twilio_calls_enabled():
     sid, token, number = twilio_credentials()
@@ -157,9 +190,9 @@ def twilio_calls_enabled():
     has_api_auth = bool(api_key and api_secret)
     has_token_auth = bool(token)
     has_webhooks = bool(public_base_url())
-    has_trial_voice = bool(twilio_trial_voice_url())
+    has_trial = twilio_use_trial_voice_flag()
     return bool(
-        sid and (has_api_auth or has_token_auth) and number and (has_webhooks or has_trial_voice)
+        sid and (has_api_auth or has_token_auth) and number and (has_webhooks or has_trial)
     )
 
 def twilio_call_error_detail(exc):
@@ -173,18 +206,29 @@ def twilio_call_error_detail(exc):
         )[:255]
     if "limited parameter access" in lower or "disallowed parameters" in lower:
         hint = (
-            "Set TWILIO_USE_TRIAL_VOICE=1 in .env to use Twilio’s trial voice template, "
-            "or upgrade the account to use this app’s /voice blood-request script."
+            "Set TWILIO_USE_TRIAL_VOICE=1 (and TWILIO_TRIAL_SCRIPT=1 for the spoken blood-request message), "
+            "or upgrade the account to use full /voice keypad responses."
         )
-        if not twilio_trial_voice_url():
+        if not twilio_use_trial_voice_flag():
             return f"Twilio trial blocked call parameters. {hint}"[:255]
         return (
             "Twilio trial blocked this call. Verify the recipient number and call within your trial region."
         )[:255]
     return raw[:255]
 
-def place_outbound_call(client, to, from_, voice_url, public_url):
-    """Trial accounts reject extra Call.create params and often reject custom voice URLs."""
+def place_outbound_call(client, to, from_, voice_url, public_url, twiml=None):
+    """Trial accounts reject extra Call.create params; inline twiml avoids custom webhook URLs."""
+    if twiml:
+        try:
+            return client.calls.create(to=to, from_=from_, twiml=twiml)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if voice_url and (
+                "twiml" in msg or "disallowed" in msg or "parameter" in msg
+            ):
+                minimal = {"to": to, "from_": from_, "url": voice_url}
+                return client.calls.create(**minimal)
+            raise
     minimal = {"to": to, "from_": from_, "url": voice_url}
     if voice_url.startswith("https://webhooks.twilio.com/"):
         return client.calls.create(**minimal)
@@ -258,7 +302,8 @@ def index():
         blood_groups=BLOOD_GROUPS,
         alert_logs=alert_logs,
         real_calls_enabled=twilio_calls_enabled(),
-        trial_voice_mode=bool(twilio_trial_voice_url()),
+        trial_voice_mode=twilio_use_trial_voice_flag(),
+        trial_script_mode=twilio_trial_script_enabled(),
     )
 
 @app.route("/hospital/add", methods=["POST"])
@@ -372,20 +417,32 @@ def alert_hospitals(request_id):
     if real_calls_enabled and hospital.verified:
         try:
             client = twilio_rest_client()
-            voice_url = twilio_outbound_voice_url(
-                blood_request.id, hospital.id, public_url
-            )
+            trial_twiml = None
+            voice_url = None
+            if twilio_trial_script_enabled():
+                trial_twiml = build_trial_alert_twiml(blood_request, hospital)
+                voice_url = TWILIO_TRIAL_VOICE_TEMPLATE
+            else:
+                voice_url = twilio_outbound_voice_url(
+                    blood_request.id, hospital.id, public_url
+                )
             call = place_outbound_call(
                 client,
                 normalize_phone_e164(hospital.phone),
                 twilio_number,
                 voice_url,
                 public_url,
+                twiml=trial_twiml,
             )
-            if twilio_trial_voice_url():
+            if twilio_trial_script_enabled():
                 call_details = (
-                    "Trial template call placed (Twilio demo script, not the blood-request message). "
-                    "Unset TWILIO_USE_TRIAL_VOICE after upgrade for full /voice alerts."
+                    "Trial script call placed — hospital hears the blood-request message "
+                    "(no press-1/2 on trial; upgrade for full /voice responses)."
+                )
+            elif twilio_trial_voice_url():
+                call_details = (
+                    "Trial Twilio demo template call placed (generic Console script). "
+                    "Set TWILIO_TRIAL_SCRIPT=1 for the Smart BloodLink message."
                 )
             else:
                 call_details = "Awaiting hospital response"
@@ -461,12 +518,7 @@ def voice_prompt(request_id, hospital_id):
         return Response("<Response><Say>Request not found. Goodbye.</Say></Response>", mimetype="text/xml")
     base = public_base_url()
     respond_url = f"{base}/voice/{request_id}/{hospital_id}/respond"
-    intro = (
-        f"Hello {hospital.name}. This is Smart BloodLink with an urgent blood request. "
-        f"We need {blood_request.units} units of {blood_request.blood_group} blood in {blood_request.city}. "
-        f"Requester contact number is {blood_request.contact_phone}. "
-        f"If you can supply this blood, press 1. If not available, press 2."
-    )
+    intro = blood_request_voice_intro(blood_request, hospital, include_keypad=True)
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?><Response>'
         f'<Gather numDigits="1" action="{escape(respond_url)}" method="POST" timeout="8">'
