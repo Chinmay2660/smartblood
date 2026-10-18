@@ -177,11 +177,10 @@ def blood_request_voice_intro(blood_request, hospital, include_keypad=True):
 def build_trial_alert_twiml(blood_request, hospital):
     from xml.sax.saxutils import escape
     spoken = blood_request_voice_intro(blood_request, hospital, include_keypad=False)
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?><Response>'
-        f'<Say voice="alice">{escape(spoken)}</Say>'
-        "</Response>"
-    )
+    return f"<Response><Say voice=\"alice\">{escape(spoken)}</Say></Response>"
+
+def trial_voice_webhook_url(request_id, hospital_id, public_url):
+    return f"{public_url}/voice/trial/{request_id}/{hospital_id}"
 
 def twilio_calls_enabled():
     sid, token, number = twilio_credentials()
@@ -216,19 +215,42 @@ def twilio_call_error_detail(exc):
         )[:255]
     return raw[:255]
 
-def place_outbound_call(client, to, from_, voice_url, public_url, twiml=None):
-    """Trial accounts reject extra Call.create params; inline twiml avoids custom webhook URLs."""
-    if twiml:
+def twilio_voice_webhook_ok():
+    if twilio_request_is_valid():
+        return True
+    # ponytail: trial voice fetches often fail signature match behind Vercel; still serve TwiML for /voice/trial only
+    return bool(
+        twilio_use_trial_voice_flag() and request.path.startswith("/voice/trial/")
+    )
+
+def place_trial_script_call(client, to, from_, public_url, request_id, hospital_id, twiml_body):
+    """Trial-safe blood-request audio: app webhook first, then inline TwiML (never the generic demo template)."""
+    if not public_url:
+        raise RuntimeError(
+            "PUBLIC_BASE_URL is required for the trial blood-request script. "
+            "Set it to your Vercel URL (e.g. https://smartblood-beta.vercel.app)."
+        )
+    trial_url = trial_voice_webhook_url(request_id, hospital_id, public_url)
+    attempts = (
+        ("app_webhook", lambda: client.calls.create(to=to, from_=from_, url=trial_url)),
+        ("inline_twiml", lambda: client.calls.create(to=to, from_=from_, twiml=twiml_body)),
+    )
+    errors = []
+    for label, create in attempts:
         try:
-            return client.calls.create(to=to, from_=from_, twiml=twiml)
+            return create(), label
         except Exception as exc:
-            msg = str(exc).lower()
-            if voice_url and (
-                "twiml" in msg or "disallowed" in msg or "parameter" in msg
-            ):
-                minimal = {"to": to, "from_": from_, "url": voice_url}
-                return client.calls.create(**minimal)
-            raise
+            errors.append(f"{label}: {exc}")
+    raise RuntimeError(
+        "Trial blood-request script failed. "
+        + "; ".join(errors)[:400]
+        + " Ensure the latest app is deployed and PUBLIC_BASE_URL matches your Vercel URL."
+    )
+
+def place_outbound_call(client, to, from_, voice_url, public_url, twiml=None):
+    """Trial accounts reject extra Call.create params."""
+    if twiml:
+        return client.calls.create(to=to, from_=from_, twiml=twiml)
     minimal = {"to": to, "from_": from_, "url": voice_url}
     if voice_url.startswith("https://webhooks.twilio.com/"):
         return client.calls.create(**minimal)
@@ -417,35 +439,47 @@ def alert_hospitals(request_id):
     if real_calls_enabled and hospital.verified:
         try:
             client = twilio_rest_client()
-            trial_twiml = None
-            voice_url = None
             if twilio_trial_script_enabled():
-                trial_twiml = build_trial_alert_twiml(blood_request, hospital)
-                voice_url = TWILIO_TRIAL_VOICE_TEMPLATE
+                twiml_body = build_trial_alert_twiml(blood_request, hospital)
+                call, delivery = place_trial_script_call(
+                    client,
+                    normalize_phone_e164(hospital.phone),
+                    twilio_number,
+                    public_url,
+                    blood_request.id,
+                    hospital.id,
+                    twiml_body,
+                )
+                if delivery == "app_webhook":
+                    call_details = (
+                        "Trial script via /voice/trial — blood-request message spoken "
+                        "(no press-1/2 on trial)."
+                    )
+                else:
+                    call_details = (
+                        "Trial script via inline TwiML — blood-request message spoken "
+                        "(no press-1/2 on trial)."
+                    )
             else:
                 voice_url = twilio_outbound_voice_url(
                     blood_request.id, hospital.id, public_url
                 )
-            call = place_outbound_call(
-                client,
-                normalize_phone_e164(hospital.phone),
-                twilio_number,
-                voice_url,
-                public_url,
-                twiml=trial_twiml,
-            )
-            if twilio_trial_script_enabled():
-                call_details = (
-                    "Trial script call placed — hospital hears the blood-request message "
-                    "(no press-1/2 on trial; upgrade for full /voice responses)."
+                call = place_outbound_call(
+                    client,
+                    normalize_phone_e164(hospital.phone),
+                    twilio_number,
+                    voice_url,
+                    public_url,
                 )
-            elif twilio_trial_voice_url():
-                call_details = (
-                    "Trial Twilio demo template call placed (generic Console script). "
-                    "Set TWILIO_TRIAL_SCRIPT=1 for the Smart BloodLink message."
-                )
-            else:
-                call_details = "Awaiting hospital response"
+                call_details = None
+            if call_details is None:
+                if twilio_trial_voice_url():
+                    call_details = (
+                        "Twilio Console demo template (generic script). "
+                        "Set TWILIO_TRIAL_SCRIPT=1 and redeploy for the blood-request message."
+                    )
+                else:
+                    call_details = "Awaiting hospital response"
             db.session.add(AlertLog(
                 request_id=blood_request.id,
                 hospital_id=hospital.id,
@@ -505,6 +539,20 @@ def alert_hospitals(request_id):
             "success",
         )
     return redirect(url_for("index"))
+
+@app.route("/voice/trial/<int:request_id>/<int:hospital_id>", methods=["GET", "POST"])
+def voice_trial_script(request_id, hospital_id):
+    from flask import Response
+    if not twilio_voice_webhook_ok():
+        return Response("<Response><Reject/></Response>", mimetype="text/xml", status=403)
+    blood_request = db.session.get(BloodRequest, request_id)
+    hospital = db.session.get(Hospital, hospital_id)
+    if not blood_request or not hospital:
+        return Response("<Response><Say>Request not found. Goodbye.</Say></Response>", mimetype="text/xml")
+    return Response(
+        build_trial_alert_twiml(blood_request, hospital),
+        mimetype="text/xml",
+    )
 
 @app.route("/voice/<int:request_id>/<int:hospital_id>", methods=["GET", "POST"])
 def voice_prompt(request_id, hospital_id):
