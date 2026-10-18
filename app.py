@@ -103,13 +103,53 @@ def public_base_url():
             url = f"https://{vercel_host}".rstrip("/")
     return url
 
+# Twilio Console “Try out Voice” templates (allowed on trial accounts).
+TWILIO_TRIAL_VOICE_TEMPLATE = (
+    "https://webhooks.twilio.com/v1/Voice/Template/voice_speech_recognition"
+)
+
+def twilio_trial_voice_url():
+    """When set, outbound calls use Twilio’s trial template URL instead of /voice/…"""
+    explicit = os.getenv("TWILIO_TRIAL_VOICE_URL", "").strip()
+    if explicit:
+        return explicit
+    flag = os.getenv("TWILIO_USE_TRIAL_VOICE", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return TWILIO_TRIAL_VOICE_TEMPLATE
+    return ""
+
+def twilio_outbound_voice_url(request_id, hospital_id, public_url):
+    trial = twilio_trial_voice_url()
+    if trial:
+        return trial
+    return f"{public_url}/voice/{request_id}/{hospital_id}"
+
 def twilio_calls_enabled():
     sid, token, number = twilio_credentials()
     api_key = os.getenv("TWILIO_API_KEY_SID", "").strip()
     api_secret = os.getenv("TWILIO_API_KEY_SECRET", "").strip()
     has_api_auth = bool(api_key and api_secret)
     has_token_auth = bool(token)
-    return bool(sid and (has_api_auth or has_token_auth) and number and public_base_url())
+    has_webhooks = bool(public_base_url())
+    has_trial_voice = bool(twilio_trial_voice_url())
+    return bool(
+        sid and (has_api_auth or has_token_auth) and number and (has_webhooks or has_trial_voice)
+    )
+
+def place_outbound_call(client, to, from_, voice_url, public_url):
+    """Trial accounts reject Method / StatusCallbackMethod on Calls.create."""
+    minimal = {"to": to, "from_": from_, "url": voice_url}
+    if voice_url.startswith("https://webhooks.twilio.com/"):
+        return client.calls.create(**minimal)
+    with_status = {**minimal, "status_callback": f"{public_url}/call-status"}
+    try:
+        return client.calls.create(**with_status)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "limited parameter access" not in msg and "disallowed parameters" not in msg:
+            raise
+        # ponytail: trial allows To, Url, optional StatusCallback — retry bare minimum
+        return client.calls.create(**minimal)
 
 def twilio_request_is_valid():
     """Validate X-Twilio-Signature when Auth Token is configured."""
@@ -131,6 +171,11 @@ def twilio_request_is_valid():
     params = request.form.to_dict(flat=False)
     flat = {k: (v[0] if len(v) == 1 else v) for k, v in params.items()}
     return validator.validate(url, flat, signature)
+
+def hospitals_for_request(blood_request, all_hospitals):
+    """Hospitals in the request city; if none match, fall back to the full network."""
+    matching = [h for h in all_hospitals if h.city.lower() == blood_request.city.lower()]
+    return matching if matching else list(all_hospitals)
 
 def seed_demo_data():
     if Hospital.query.count():
@@ -162,15 +207,20 @@ def index():
         "units": total_units,
     }
     alert_logs = AlertLog.query.order_by(AlertLog.created_at.desc()).limit(12).all()
+    request_alert_targets = {
+        r.id: hospitals_for_request(r, hospitals) for r in requests_list
+    }
     return render_template(
         "index.html",
         hospitals=hospitals,
         requests=requests_list,
+        request_alert_targets=request_alert_targets,
         low_stock=low_stock,
         stats=stats,
         blood_groups=BLOOD_GROUPS,
         alert_logs=alert_logs,
         real_calls_enabled=twilio_calls_enabled(),
+        trial_voice_mode=bool(twilio_trial_voice_url()),
     )
 
 @app.route("/hospital/add", methods=["POST"])
@@ -249,7 +299,7 @@ def add_request():
                                  city=city, contact_phone=phone, urgency=urgency)
     db.session.add(blood_request)
     db.session.commit()
-    flash(f"Blood request #{blood_request.id} created. Use “Alert hospitals” to notify matching hospitals.", "success")
+    flash(f"Blood request #{blood_request.id} created. Select a hospital and use “Alert hospital” to notify.", "success")
     return redirect(url_for("index"))
 
 @app.route("/request/<int:request_id>/alert", methods=["POST"])
@@ -259,78 +309,114 @@ def alert_hospitals(request_id):
         flash("Blood request not found.", "error")
         return redirect(url_for("index"))
 
-    twilio_sid, twilio_token, twilio_number = twilio_credentials()
-    public_url = public_base_url()
-    real_calls_enabled = twilio_calls_enabled()
+    try:
+        hospital_id = int(request.form.get("hospital_id", ""))
+    except ValueError:
+        flash("Please select a hospital to alert.", "error")
+        return redirect(url_for("index"))
 
-
-
-    matching = Hospital.query.filter(db.func.lower(Hospital.city) == blood_request.city.lower()).all()
-    if not matching:
-        matching = Hospital.query.all()
-    if not matching:
+    all_hospitals = Hospital.query.order_by(Hospital.name).all()
+    if not all_hospitals:
         flash("No hospitals have been added yet.", "error")
         return redirect(url_for("index"))
 
-    called = 0
-    for hospital in matching:
-        stock = BloodStock.query.filter_by(hospital_id=hospital.id, blood_group=blood_request.blood_group).first()
-        stock_units = stock.units if stock else 0
-        if real_calls_enabled and hospital.verified:
-            try:
-                client = twilio_rest_client()
-                twiml_url = f"{public_url}/voice/{blood_request.id}/{hospital.id}"
-                call = client.calls.create(
-                    to=hospital.phone,
-                    from_=twilio_number,
-                    url=twiml_url,
-                    method="POST",
-                    status_callback=f"{public_url}/call-status",
-                    status_callback_method="POST"
-                )
-                db.session.add(AlertLog(
-                    request_id=blood_request.id,
-                    hospital_id=hospital.id,
-                    hospital_name=hospital.name,
-                    result="Call placed",
-                    details="Awaiting hospital response",
-                    call_sid=call.sid,
-                ))
-                called += 1
-            except Exception as exc:
-                db.session.add(AlertLog(request_id=blood_request.id, hospital_name=hospital.name,
-                                        result="Call failed", details=str(exc)[:220]))
-        else:
-            result = "Demo alert"
-            if real_calls_enabled and not hospital.verified:
-                details = (
-                    f"Hospital not verified — no call placed. "
-                    f"Inventory listed: {stock_units} unit(s) of {blood_request.blood_group}. "
-                    f"Use “Verify hospital” in the network section (requires ADMIN_VERIFY_KEY)."
+    eligible = hospitals_for_request(blood_request, all_hospitals)
+    eligible_ids = {h.id for h in eligible}
+    hospital = db.session.get(Hospital, hospital_id)
+    if not hospital or hospital.id not in eligible_ids:
+        flash("Choose a hospital in the request’s city (or any hospital if none match that city).", "error")
+        return redirect(url_for("index"))
+
+    _, _, twilio_number = twilio_credentials()
+    public_url = public_base_url()
+    real_calls_enabled = twilio_calls_enabled()
+
+    stock = BloodStock.query.filter_by(
+        hospital_id=hospital.id, blood_group=blood_request.blood_group
+    ).first()
+    stock_units = stock.units if stock else 0
+    called = False
+
+    if real_calls_enabled and hospital.verified:
+        try:
+            client = twilio_rest_client()
+            voice_url = twilio_outbound_voice_url(
+                blood_request.id, hospital.id, public_url
+            )
+            call = place_outbound_call(
+                client, hospital.phone, twilio_number, voice_url, public_url
+            )
+            if twilio_trial_voice_url():
+                call_details = (
+                    "Trial template call placed (Twilio demo script, not the blood-request message). "
+                    "Unset TWILIO_USE_TRIAL_VOICE after upgrade for full /voice alerts."
                 )
             else:
-                details = (
-                    f"Inventory listed: {stock_units} unit(s) of {blood_request.blood_group}. "
-                    f"No call placed (Twilio or public URL not configured)."
+                call_details = "Awaiting hospital response"
+            db.session.add(AlertLog(
+                request_id=blood_request.id,
+                hospital_id=hospital.id,
+                hospital_name=hospital.name,
+                result="Call placed",
+                details=call_details,
+                call_sid=call.sid,
+            ))
+            called = True
+        except Exception as exc:
+            detail = str(exc)[:220]
+            if "limited parameter access" in detail.lower():
+                detail = (
+                    "Twilio trial blocked this call. Verify recipient numbers in Twilio, "
+                    "call within your trial country, or upgrade the account. "
+                    f"({detail[:120]})"
                 )
-            db.session.add(AlertLog(request_id=blood_request.id, hospital_name=hospital.name,
-                                    result=result, details=details))
+            db.session.add(
+                AlertLog(
+                    request_id=blood_request.id,
+                    hospital_name=hospital.name,
+                    result="Call failed",
+                    details=detail,
+                )
+            )
+    else:
+        result = "Demo alert"
+        if real_calls_enabled and not hospital.verified:
+            details = (
+                f"Hospital not verified — no call placed. "
+                f"Inventory listed: {stock_units} unit(s) of {blood_request.blood_group}. "
+                f"Use “Verify hospital” in the network section (requires ADMIN_VERIFY_KEY)."
+            )
+        else:
+            details = (
+                f"Inventory listed: {stock_units} unit(s) of {blood_request.blood_group}. "
+                f"No call placed (Twilio or public URL not configured)."
+            )
+        db.session.add(AlertLog(
+            request_id=blood_request.id,
+            hospital_name=hospital.name,
+            result=result,
+            details=details,
+        ))
     db.session.commit()
     if real_calls_enabled:
         if called:
             flash(
-                f"Alert process completed. Real calls attempted to {called} verified hospital(s); "
-                "check alert history and confirm responses manually.",
+                f"Call placed to {hospital.name}. Check alert history and confirm the response manually.",
                 "success",
             )
+        elif hospital.verified:
+            flash(f"Call to {hospital.name} failed. See alert history for details.", "error")
         else:
             flash(
-                "Twilio is enabled but no verified hospitals received a call. "
-                "Verify each hospital’s contact in the network section, then alert again.",
+                f"{hospital.name} is not verified for outbound calls. "
+                "Verify the hospital in the network section, then try again.",
                 "error",
             )
     else:
-        flash("Demo alerts created. No real phone calls were placed. Add Twilio settings and a public HTTPS URL to enable calling.", "success")
+        flash(
+            f"Demo alert logged for {hospital.name}. No real phone call was placed.",
+            "success",
+        )
     return redirect(url_for("index"))
 
 @app.route("/voice/<int:request_id>/<int:hospital_id>", methods=["GET", "POST"])
