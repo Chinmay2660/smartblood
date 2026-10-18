@@ -302,12 +302,33 @@ def alert_hospitals(request_id):
                                         result="Call failed", details=str(exc)[:220]))
         else:
             result = "Demo alert"
-            details = f"Inventory listed: {stock_units} unit(s) of {blood_request.blood_group}. No call placed."
+            if real_calls_enabled and not hospital.verified:
+                details = (
+                    f"Hospital not verified — no call placed. "
+                    f"Inventory listed: {stock_units} unit(s) of {blood_request.blood_group}. "
+                    f"Use “Verify hospital” in the network section (requires ADMIN_VERIFY_KEY)."
+                )
+            else:
+                details = (
+                    f"Inventory listed: {stock_units} unit(s) of {blood_request.blood_group}. "
+                    f"No call placed (Twilio or public URL not configured)."
+                )
             db.session.add(AlertLog(request_id=blood_request.id, hospital_name=hospital.name,
                                     result=result, details=details))
     db.session.commit()
     if real_calls_enabled:
-        flash(f"Alert process completed. Real calls attempted to {called} verified hospital(s); check alert history and confirm responses manually.", "success")
+        if called:
+            flash(
+                f"Alert process completed. Real calls attempted to {called} verified hospital(s); "
+                "check alert history and confirm responses manually.",
+                "success",
+            )
+        else:
+            flash(
+                "Twilio is enabled but no verified hospitals received a call. "
+                "Verify each hospital’s contact in the network section, then alert again.",
+                "error",
+            )
     else:
         flash("Demo alerts created. No real phone calls were placed. Add Twilio settings and a public HTTPS URL to enable calling.", "success")
     return redirect(url_for("index"))
