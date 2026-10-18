@@ -243,19 +243,11 @@ def twilio_voice_webhook_ok():
     return twilio_request_is_valid()
 
 def create_outbound_call(client, to, from_, **kwargs):
-    """Trial Voice assigns its own From per verified recipient — passing From causes 403."""
-    if twilio_use_production_voice():
-        return client.calls.create(to=to, from_=from_, **kwargs)
-    try:
-        return client.calls.create(to=to, **kwargs)
-    except Exception as exc:
-        lower = str(exc).lower()
-        if from_ and (
-            "assigned to this verified voice recipient" in lower
-            or "assigned trial number" in lower
-        ):
-            return client.calls.create(to=to, **kwargs)
-        raise
+    """Twilio Python SDK requires from_; must match trial verified-recipient pairing."""
+    from_num = (from_ or twilio_from_number()).strip()
+    if not from_num:
+        raise RuntimeError("Set TWILIO_PHONE_NUMBER to your Twilio voice number in E.164 format.")
+    return client.calls.create(to=to, from_=from_num, **kwargs)
 
 def place_trial_script_call(client, to, from_, public_url, request_id, hospital_id, twiml_body):
     """Blood-request audio without the full /voice keypad flow (works on Twilio trial)."""
@@ -691,10 +683,11 @@ def api_twilio_status():
         "trial_script": should_use_trial_script(),
         "production_voice": twilio_use_production_voice(),
         "configured_from_last4": tail,
-        "sends_from_on_trial": False,
+        "sends_from_on_trial": bool(twilio_from_number()),
         "public_base_host": (public_base_url() or "").replace("https://", "").split("/")[0],
         "trial_note": (
-            "Trial Voice omits From (Twilio assigns it). US trial cannot call +91 — upgrade for India."
+            "TWILIO_PHONE_NUMBER must match the Twilio number linked to each verified recipient on trial. "
+            "US trial cannot call +91 — upgrade for India."
         ),
     })
 
