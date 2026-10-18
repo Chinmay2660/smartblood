@@ -35,7 +35,7 @@
     <header class="topbar">
       <div class="mobile-brand">✚ SmartBloodLink</div>
       <div class="breadcrumb">Workspace <span>/</span> <strong>Overview</strong></div>
-      <div class="top-actions"><span class="status-dot"></span><span class="system-status">Network demo mode</span><button class="icon-button" title="Notifications">♧<i></i></button><div class="avatar small">SB</div></div>
+      <div class="top-actions"><span class="status-dot"></span><span class="system-status">{% if real_calls_enabled %}Twilio calling enabled{% else %}Demo mode — no live calls{% endif %}</span><button class="icon-button" title="Notifications">♧<i></i></button><div class="avatar small">SB</div></div>
     </header>
 
     <section class="page-heading" id="overview">
@@ -90,12 +90,23 @@
       <div class="table-heading"><div><div class="panel-kicker">LIVE WORK QUEUE</div><h2>Recent blood requests</h2></div><span class="pill neutral">{{ requests|length }} recent</span></div>
       <div class="table-scroll"><table><thead><tr><th>REQUEST</th><th>BLOOD GROUP</th><th>LOCATION</th><th>UNITS</th><th>URGENCY</th><th>STATUS</th><th>ACTION</th></tr></thead><tbody>
       {% for item in requests %}
-        <tr><td><div class="request-person"><div class="person-icon">{{ item.patient_name[:1]|upper }}</div><div><strong>#BL-{{ "%04d"|format(item.id) }}</strong><small>{{ item.patient_name }}</small></div></div></td><td><span class="blood-badge">{{ item.blood_group }}</span></td><td>{{ item.city }}</td><td>{{ item.units }} units</td><td><span class="urgency {{ item.urgency|lower }}">{{ item.urgency }}</span></td><td><span class="status-pill {{ 'open' if item.status == 'Open' else 'closed' }}"><i></i>{{ item.status }}</span></td><td><form action="{{ url_for('alert_hospitals', request_id=item.id) }}" method="POST" onsubmit="return confirm('Start the hospital alert process? In demo mode, no calls are placed.');"><button class="table-action" type="submit">Alert hospitals ↗</button></form></td></tr>
+        <tr><td><div class="request-person"><div class="person-icon">{{ item.patient_name[:1]|upper }}</div><div><strong>#BL-{{ "%04d"|format(item.id) }}</strong><small>{{ item.patient_name }}</small></div></div></td><td><span class="blood-badge">{{ item.blood_group }}</span></td><td>{{ item.city }}</td><td>{{ item.units }} units</td><td><span class="urgency {{ item.urgency|lower }}">{{ item.urgency }}</span></td><td><span class="status-pill {{ 'open' if item.status == 'Open' else 'closed' }}"><i></i>{{ item.status }}</span></td><td><form action="{{ url_for('alert_hospitals', request_id=item.id) }}" method="POST" onsubmit="return confirm('{% if real_calls_enabled %}This will place real phone calls to verified hospitals. Continue?{% else %}Start the hospital alert process? No live calls will be placed in demo mode.{% endif %}');"><button class="table-action" type="submit">Alert hospitals ↗</button></form></td></tr>
       {% else %}
         <tr><td colspan="7" class="empty-table">No requests yet. Create the first request above.</td></tr>
       {% endfor %}
       </tbody></table></div>
       <div class="table-footer"><span>Showing recent requests</span><span class="footer-note"><i></i> Data stored locally in this demo</span></div>
+    </section>
+
+    <section class="panel table-panel" id="alerts">
+      <div class="table-heading"><div><div class="panel-kicker">COORDINATION LOG</div><h2>Alert history</h2></div><span class="pill neutral">{{ alert_logs|length }} recent</span></div>
+      <div class="table-scroll"><table><thead><tr><th>REQUEST</th><th>HOSPITAL</th><th>RESULT</th><th>DETAILS</th><th>TIME</th></tr></thead><tbody>
+      {% for log in alert_logs %}
+        <tr><td>#BL-{{ "%04d"|format(log.request_id) }}</td><td>{{ log.hospital_name }}</td><td><span class="urgency {% if log.result == 'Available' %}routine{% elif log.result in ['Call failed', 'Not available'] %}critical{% else %}urgent{% endif %}">{{ log.result }}</span></td><td>{{ log.details }}</td><td>{{ log.created_at.strftime('%d %b, %H:%M') }}</td></tr>
+      {% else %}
+        <tr><td colspan="5" class="empty-table">No alerts yet. Create a request and use Alert hospitals.</td></tr>
+      {% endfor %}
+      </tbody></table></div>
     </section>
 
     <section class="bottom-grid">

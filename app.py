@@ -1,5 +1,5 @@
 import os
-import hmac
+import secrets
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -7,10 +7,35 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def resolve_database_uri():
+    """Neon on Vercel injects DATABASE_URL (pooled). Local dev falls back to SQLite."""
+    for key in ("DATABASE_URL", "POSTGRES_URL"):
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            continue
+        if raw.startswith("postgres://"):
+            raw = "postgresql://" + raw[len("postgres://") :]
+        if raw.startswith("postgresql://"):
+            return "postgresql+psycopg://" + raw[len("postgresql://") :]
+        return raw
+    if os.getenv("VERCEL"):
+        raise RuntimeError(
+            "DATABASE_URL is required on Vercel. Install Neon from the Vercel Marketplace "
+            "or set DATABASE_URL to your Neon pooled connection string."
+        )
+    return "sqlite:///smart_bloodlink.db"
+
+
+_database_uri = resolve_database_uri()
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-this-secret-before-deployment")
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///smart_bloodlink.db"
+app.config["SQLALCHEMY_DATABASE_URI"] = _database_uri
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+if _database_uri.startswith("postgresql"):
+    # ponytail: one pool per serverless instance; Neon pooled URL + pre_ping avoids stale conns
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True, "pool_recycle": 300}
 db = SQLAlchemy(app)
 
 BLOOD_GROUPS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
@@ -46,11 +71,66 @@ class BloodRequest(db.Model):
 class AlertLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     request_id = db.Column(db.Integer, db.ForeignKey("blood_request.id"), nullable=False)
+    hospital_id = db.Column(db.Integer, db.ForeignKey("hospital.id"), nullable=True)
     hospital_name = db.Column(db.String(120), nullable=False)
     result = db.Column(db.String(40), nullable=False)
     details = db.Column(db.String(255), default="")
+    call_sid = db.Column(db.String(64), default="")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     blood_request = db.relationship("BloodRequest", backref="alerts")
+
+def twilio_credentials():
+    sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+    return sid, token, number
+
+def twilio_rest_client():
+    """Use API key (SK…) if set; otherwise Account SID + primary Auth Token."""
+    from twilio.rest import Client
+    account_sid, auth_token, _ = twilio_credentials()
+    api_key = os.getenv("TWILIO_API_KEY_SID", "").strip()
+    api_secret = os.getenv("TWILIO_API_KEY_SECRET", "").strip()
+    if api_key and api_secret:
+        return Client(api_key, api_secret, account_sid)
+    return Client(account_sid, auth_token)
+
+def public_base_url():
+    url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not url:
+        vercel_host = os.getenv("VERCEL_URL", "").strip()
+        if vercel_host:
+            url = f"https://{vercel_host}".rstrip("/")
+    return url
+
+def twilio_calls_enabled():
+    sid, token, number = twilio_credentials()
+    api_key = os.getenv("TWILIO_API_KEY_SID", "").strip()
+    api_secret = os.getenv("TWILIO_API_KEY_SECRET", "").strip()
+    has_api_auth = bool(api_key and api_secret)
+    has_token_auth = bool(token)
+    return bool(sid and (has_api_auth or has_token_auth) and number and public_base_url())
+
+def twilio_request_is_valid():
+    """Validate X-Twilio-Signature when Auth Token is configured."""
+    _, token, _ = twilio_credentials()
+    if not token:
+        return True
+    from twilio.request_validator import RequestValidator
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        return False
+    validator = RequestValidator(token)
+    # Behind reverse proxies, request.url may differ from the URL Twilio called.
+    callback_url = public_base_url()
+    if callback_url:
+        path = request.full_path.rstrip("?") if request.query_string else request.path
+        url = f"{callback_url}{path}"
+    else:
+        url = request.url
+    params = request.form.to_dict(flat=False)
+    flat = {k: (v[0] if len(v) == 1 else v) for k, v in params.items()}
+    return validator.validate(url, flat, signature)
 
 def seed_demo_data():
     if Hospital.query.count():
@@ -81,8 +161,17 @@ def index():
         "low_stock": len(low_stock),
         "units": total_units,
     }
-    return render_template("index.html", hospitals=hospitals, requests=requests_list,
-                           low_stock=low_stock, stats=stats, blood_groups=BLOOD_GROUPS)
+    alert_logs = AlertLog.query.order_by(AlertLog.created_at.desc()).limit(12).all()
+    return render_template(
+        "index.html",
+        hospitals=hospitals,
+        requests=requests_list,
+        low_stock=low_stock,
+        stats=stats,
+        blood_groups=BLOOD_GROUPS,
+        alert_logs=alert_logs,
+        real_calls_enabled=twilio_calls_enabled(),
+    )
 
 @app.route("/hospital/add", methods=["POST"])
 def add_hospital():
@@ -100,6 +189,25 @@ def add_hospital():
         db.session.add(BloodStock(hospital_id=hospital.id, blood_group=group, units=0))
     db.session.commit()
     flash("Hospital added. Its contact details must be verified before real alerts are enabled.", "success")
+    return redirect(url_for("index"))
+
+@app.route("/hospital/<int:hospital_id>/verify", methods=["POST"])
+def verify_hospital(hospital_id):
+    expected = os.getenv("ADMIN_VERIFY_KEY", "").strip()
+    provided = request.form.get("admin_key", "")
+    if not expected:
+        flash("Hospital verification is disabled. Set ADMIN_VERIFY_KEY in .env first.", "error")
+        return redirect(url_for("index"))
+    if not secrets.compare_digest(provided, expected):
+        flash("Invalid administrator key.", "error")
+        return redirect(url_for("index"))
+    hospital = db.session.get(Hospital, hospital_id)
+    if not hospital:
+        flash("Hospital not found.", "error")
+        return redirect(url_for("index"))
+    hospital.verified = True
+    db.session.commit()
+    flash(f"{hospital.name} marked as verified for outbound alerts.", "success")
     return redirect(url_for("index"))
 
 @app.route("/stock/update", methods=["POST"])
@@ -151,12 +259,9 @@ def alert_hospitals(request_id):
         flash("Blood request not found.", "error")
         return redirect(url_for("index"))
 
-    # Safe demo mode: no phone calls are placed unless Twilio credentials and a public callback URL exist.
-    twilio_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-    twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-    twilio_number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
-    public_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-    real_calls_enabled = all([twilio_sid, twilio_token, twilio_number, public_url])
+    twilio_sid, twilio_token, twilio_number = twilio_credentials()
+    public_url = public_base_url()
+    real_calls_enabled = twilio_calls_enabled()
 
 
 
@@ -173,8 +278,7 @@ def alert_hospitals(request_id):
         stock_units = stock.units if stock else 0
         if real_calls_enabled and hospital.verified:
             try:
-                from twilio.rest import Client
-                client = Client(twilio_sid, twilio_token)
+                client = twilio_rest_client()
                 twiml_url = f"{public_url}/voice/{blood_request.id}/{hospital.id}"
                 call = client.calls.create(
                     to=hospital.phone,
@@ -184,8 +288,14 @@ def alert_hospitals(request_id):
                     status_callback=f"{public_url}/call-status",
                     status_callback_method="POST"
                 )
-                db.session.add(AlertLog(request_id=blood_request.id, hospital_name=hospital.name,
-                                        result="Call placed", details=f"Call SID: {call.sid}"))
+                db.session.add(AlertLog(
+                    request_id=blood_request.id,
+                    hospital_id=hospital.id,
+                    hospital_name=hospital.name,
+                    result="Call placed",
+                    details="Awaiting hospital response",
+                    call_sid=call.sid,
+                ))
                 called += 1
             except Exception as exc:
                 db.session.add(AlertLog(request_id=blood_request.id, hospital_name=hospital.name,
@@ -206,25 +316,77 @@ def alert_hospitals(request_id):
 def voice_prompt(request_id, hospital_id):
     from flask import Response
     from xml.sax.saxutils import escape
+    if not twilio_request_is_valid():
+        return Response("<Response><Reject/></Response>", mimetype="text/xml", status=403)
     blood_request = db.session.get(BloodRequest, request_id)
     hospital = db.session.get(Hospital, hospital_id)
     if not blood_request or not hospital:
         return Response("<Response><Say>Request not found. Goodbye.</Say></Response>", mimetype="text/xml")
-    message = (f"Hello {hospital.name}. Smart BloodLink has an urgent blood request. "
-               f"{blood_request.units} unit or units of {blood_request.blood_group} blood are requested in "
-               f"{blood_request.city}. Please check your verified inventory and contact the requester or the "
-               f"hospital coordination team. This automated message is not a confirmation of availability. Goodbye.")
-    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">{escape(message)}</Say></Response>'
+    base = public_base_url()
+    respond_url = f"{base}/voice/{request_id}/{hospital_id}/respond"
+    intro = (
+        f"Hello {hospital.name}. This is Smart BloodLink with an urgent blood request. "
+        f"We need {blood_request.units} units of {blood_request.blood_group} blood in {blood_request.city}. "
+        f"Requester contact number is {blood_request.contact_phone}. "
+        f"If you can supply this blood, press 1. If not available, press 2."
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?><Response>'
+        f'<Gather numDigits="1" action="{escape(respond_url)}" method="POST" timeout="8">'
+        f'<Say voice="alice">{escape(intro)}</Say>'
+        "</Gather>"
+        "<Say>We did not receive a response. Please call the requesting hospital directly. Goodbye.</Say>"
+        "</Response>"
+    )
+    return Response(xml, mimetype="text/xml")
+
+@app.route("/voice/<int:request_id>/<int:hospital_id>/respond", methods=["POST"])
+def voice_respond(request_id, hospital_id):
+    from flask import Response
+    from xml.sax.saxutils import escape
+    if not twilio_request_is_valid():
+        return Response("<Response><Reject/></Response>", mimetype="text/xml", status=403)
+    digit = request.form.get("Digits", "")
+    call_sid = request.form.get("CallSid", "")
+    blood_request = db.session.get(BloodRequest, request_id)
+    hospital = db.session.get(Hospital, hospital_id)
+    log = None
+    if call_sid:
+        log = AlertLog.query.filter_by(call_sid=call_sid).first()
+    if not log:
+        log = AlertLog.query.filter_by(request_id=request_id, hospital_id=hospital_id).order_by(
+            AlertLog.created_at.desc()
+        ).first()
+    if digit == "1":
+        reply = "Thank you. Your response is recorded as available. A coordinator may call you shortly."
+        if log:
+            log.result = "Available"
+            log.details = f"Hospital pressed 1 (can supply {blood_request.blood_group if blood_request else 'blood'})"
+    elif digit == "2":
+        reply = "Thank you. Your response is recorded as not available. Goodbye."
+        if log:
+            log.result = "Not available"
+            log.details = "Hospital pressed 2 (cannot supply)"
+    else:
+        reply = "Invalid input. Please contact the requesting hospital directly. Goodbye."
+        if log:
+            log.result = "No valid response"
+            log.details = f"Unexpected keypad input: {digit or 'none'}"
+    if log:
+        db.session.commit()
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">{escape(reply)}</Say></Response>'
     return Response(xml, mimetype="text/xml")
 
 @app.route("/call-status", methods=["POST"])
 def call_status():
-    # Basic callback endpoint. Validate Twilio webhook signatures before production use.
+    if not twilio_request_is_valid():
+        return ("Forbidden", 403)
     status = request.form.get("CallStatus", "unknown")
     sid = request.form.get("CallSid", "")
-    log = AlertLog.query.filter(AlertLog.details.contains(sid)).first() if sid else None
-    if log:
-        log.details = f"Call SID: {sid}; status: {status}"
+    log = AlertLog.query.filter_by(call_sid=sid).first() if sid else None
+    if log and status in {"busy", "failed", "no-answer", "canceled"}:
+        log.result = "Call failed"
+        log.details = f"Twilio status: {status}"
         db.session.commit()
     return ("", 204)
 
@@ -237,8 +399,34 @@ def api_summary():
         "total_units": db.session.query(db.func.sum(BloodStock.units)).scalar() or 0
     })
 
+def ensure_alert_log_columns():
+    """create_all does not add new columns on existing databases."""
+    from sqlalchemy import inspect, text
+    if not inspect(db.engine).has_table("alert_log"):
+        return
+    cols = {c["name"] for c in inspect(db.engine).get_columns("alert_log")}
+    dialect = db.engine.dialect.name
+    additions = []
+    if "hospital_id" not in cols:
+        additions.append(
+            "ALTER TABLE alert_log ADD COLUMN IF NOT EXISTS hospital_id INTEGER"
+            if dialect == "postgresql"
+            else "ALTER TABLE alert_log ADD COLUMN hospital_id INTEGER"
+        )
+    if "call_sid" not in cols:
+        additions.append(
+            "ALTER TABLE alert_log ADD COLUMN IF NOT EXISTS call_sid VARCHAR(64) DEFAULT ''"
+            if dialect == "postgresql"
+            else "ALTER TABLE alert_log ADD COLUMN call_sid VARCHAR(64) DEFAULT ''"
+        )
+    for stmt in additions:
+        db.session.execute(text(stmt))
+    if additions:
+        db.session.commit()
+
 with app.app_context():
     db.create_all()
+    ensure_alert_log_columns()
     seed_demo_data()
 
 if __name__ == "__main__":
