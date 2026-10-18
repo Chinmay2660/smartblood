@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart BloodLink | Emergency Blood Network</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="{{ url_for('index') }}">
+      <span class="brand-mark"><span></span><span></span><span></span></span>
+      <span>Smart<span class="brand-light">BloodLink</span><small>EMERGENCY NETWORK</small></span>
+    </a>
+    <div class="nav-label">WORKSPACE</div>
+    <a class="nav-item active" href="#overview"><span class="nav-icon">▦</span> Overview</a>
+    <a class="nav-item" href="#requests"><span class="nav-icon">♡</span> Blood requests <span class="nav-count">{{ stats.open_requests }}</span></a>
+    <a class="nav-item" href="#hospitals"><span class="nav-icon">⌂</span> Hospital network</a>
+    <a class="nav-item" href="#inventory"><span class="nav-icon">▤</span> Blood inventory</a>
+    <div class="sidebar-bottom">
+      <div class="help-card">
+        <div class="help-icon">✚</div>
+        <strong>Every second matters.</strong>
+        <p>Connect urgent blood needs with local hospitals faster.</p>
+        <a href="#new-request">Create a request ↗</a>
+      </div>
+      <div class="profile"><div class="avatar">SB</div><div><strong>Network Admin</strong><small>Demo workspace</small></div><span class="profile-dots">•••</span></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="mobile-brand">✚ SmartBloodLink</div>
+      <div class="breadcrumb">Workspace <span>/</span> <strong>Overview</strong></div>
+      <div class="top-actions"><span class="status-dot"></span><span class="system-status">Network demo mode</span><button class="icon-button" title="Notifications">♧<i></i></button><div class="avatar small">SB</div></div>
+    </header>
+
+    <section class="page-heading" id="overview">
+      <div>
+        <div class="eyebrow"><span class="live-dot"></span> EMERGENCY RESPONSE DASHBOARD</div>
+        <h1>Good evening, <span>Coordinator.</span></h1>
+        <p>One connected network. A faster response when every second counts.</p>
+      </div>
+      <a class="button button-primary" href="#new-request"><span>＋</span> New blood request</a>
+    </section>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}<div class="flash-wrap">{% for category, message in messages %}<div class="flash {{ category }}">{{ message }}<button onclick="this.parentElement.remove()">×</button></div>{% endfor %}</div>{% endif %}
+    {% endwith %}
+
+    <section class="stats-grid">
+      <article class="stat-card"><div class="stat-top"><span class="stat-label">Registered hospitals</span><span class="stat-icon purple">⌂</span></div><div class="stat-number">{{ stats.hospitals }}<small> facilities</small></div><div class="stat-foot"><span class="tiny-check">✓</span> Network directory</div></article>
+      <article class="stat-card"><div class="stat-top"><span class="stat-label">Open blood requests</span><span class="stat-icon red">♡</span></div><div class="stat-number">{{ stats.open_requests }}<small> requests</small></div><div class="stat-foot"><span class="red-text">Needs coordination</span></div></article>
+      <article class="stat-card"><div class="stat-top"><span class="stat-label">Low-stock entries</span><span class="stat-icon amber">⚠</span></div><div class="stat-number">{{ stats.low_stock }}<small> entries</small></div><div class="stat-foot"><span class="amber-text">2 units or fewer</span></div></article>
+      <article class="stat-card"><div class="stat-top"><span class="stat-label">Listed blood units</span><span class="stat-icon green">✚</span></div><div class="stat-number">{{ stats.units }}<small> units</small></div><div class="stat-foot"><span class="green-text">Based on entered inventory</span></div></article>
+    </section>
+
+    <section class="content-grid">
+      <article class="panel request-panel" id="new-request">
+        <div class="panel-heading"><div><div class="panel-kicker">FAST RESPONSE</div><h2>Create blood request</h2><p>Send an urgent requirement to the hospital network.</p></div><span class="panel-symbol red">♡</span></div>
+        <form action="{{ url_for('add_request') }}" method="POST" class="form-grid">
+          <label class="full">Patient / reference name<input name="patient_name" required placeholder="e.g. Patient A or case ID"></label>
+          <label>Blood group<select name="blood_group" required>{% for group in blood_groups %}<option value="{{ group }}">{{ group }}</option>{% endfor %}</select></label>
+          <label>Units needed<input name="units" type="number" min="1" max="20" value="2" required></label>
+          <label>City / area<input name="city" value="Mumbai" required></label>
+          <label>Urgency<select name="urgency"><option>Critical</option><option selected>Urgent</option><option>Routine</option></select></label>
+          <label class="full">Contact phone<input name="contact_phone" type="tel" required placeholder="+91 98765 43210"></label>
+          <button class="button button-primary full" type="submit">Create request <span>→</span></button>
+        </form>
+        <div class="privacy-note"><span>ⓘ</span> Share only the minimum patient information needed for coordination.</div>
+      </article>
+
+      <article class="panel low-stock-panel">
+        <div class="panel-heading"><div><div class="panel-kicker">INVENTORY WATCH</div><h2>Low stock watchlist</h2><p>Blood groups currently listed at 2 units or fewer.</p></div><span class="panel-symbol amber">⚠</span></div>
+        <div class="watch-list">
+          {% for item in low_stock[:6] %}
+          <div class="watch-item"><div class="blood-badge">{{ item.blood_group }}</div><div class="watch-info"><strong>{{ item.hospital.name }}</strong><small>{{ item.hospital.city }}</small></div><div class="units-warning"><strong>{{ item.units }}</strong><small>units</small></div></div>
+          {% else %}
+          <div class="empty-state">No low-stock entries right now.</div>
+          {% endfor %}
+        </div>
+        <a class="text-link" href="#inventory">Review inventory <span>→</span></a>
+      </article>
+    </section>
+
+    <section class="panel table-panel" id="requests">
+      <div class="table-heading"><div><div class="panel-kicker">LIVE WORK QUEUE</div><h2>Recent blood requests</h2></div><span class="pill neutral">{{ requests|length }} recent</span></div>
+      <div class="table-scroll"><table><thead><tr><th>REQUEST</th><th>BLOOD GROUP</th><th>LOCATION</th><th>UNITS</th><th>URGENCY</th><th>STATUS</th><th>ACTION</th></tr></thead><tbody>
+      {% for item in requests %}
+        <tr><td><div class="request-person"><div class="person-icon">{{ item.patient_name[:1]|upper }}</div><div><strong>#BL-{{ "%04d"|format(item.id) }}</strong><small>{{ item.patient_name }}</small></div></div></td><td><span class="blood-badge">{{ item.blood_group }}</span></td><td>{{ item.city }}</td><td>{{ item.units }} units</td><td><span class="urgency {{ item.urgency|lower }}">{{ item.urgency }}</span></td><td><span class="status-pill {{ 'open' if item.status == 'Open' else 'closed' }}"><i></i>{{ item.status }}</span></td><td><form action="{{ url_for('alert_hospitals', request_id=item.id) }}" method="POST" onsubmit="return confirm('Start the hospital alert process? In demo mode, no calls are placed.');"><button class="table-action" type="submit">Alert hospitals ↗</button></form></td></tr>
+      {% else %}
+        <tr><td colspan="7" class="empty-table">No requests yet. Create the first request above.</td></tr>
+      {% endfor %}
+      </tbody></table></div>
+      <div class="table-footer"><span>Showing recent requests</span><span class="footer-note"><i></i> Data stored locally in this demo</span></div>
+    </section>
+
+    <section class="bottom-grid">
+      <article class="panel" id="hospitals">
+        <div class="table-heading"><div><div class="panel-kicker">CONNECTED FACILITIES</div><h2>Hospital network</h2></div><span class="pill neutral">{{ hospitals|length }} hospitals</span></div>
+        <div class="hospital-list">
+        {% for hospital in hospitals %}
+  <div class="hospital-row">
+    <div class="hospital-logo">
+      {{ hospital.name[:1]|upper }}
+    </div>
+
+    <div class="hospital-info">
+      <strong>{{ hospital.name }}</strong>
+      <small>{{ hospital.city }} · {{ hospital.phone }}</small>
+    </div>
+
+    {% if hospital.verified %}
+
+      <span class="verified">✓ Verified</span>
+
+    {% else %}
+
+      <div class="verification-action">
+        <span class="unverified">Pending check</span>
+
+        <details>
+          <summary>Verify hospital</summary>
+
+          <form
+            action="{{ url_for('verify_hospital', hospital_id=hospital.id) }}"
+            method="POST"
+          >
+            <label>
+              Administrator key
+              <input
+                type="password"
+                name="admin_key"
+                required
+                autocomplete="current-password"
+                placeholder="Enter administrator key"
+              >
+            </label>
+
+            <button class="button button-primary" type="submit">
+              Confirm verification
+            </button>
+          </form>
+        </details>
+      </div>
+
+    {% endif %}
+  </div>
+{% endfor %}
+        </div>
+        <details class="inline-details"><summary>＋ Add a hospital</summary><form action="{{ url_for('add_hospital') }}" method="POST" class="compact-form"><input name="name" placeholder="Hospital name" required><input name="city" placeholder="City" required><input name="phone" placeholder="Phone number" required><input name="email" type="email" placeholder="Email (optional)"><button class="button button-primary" type="submit">Add hospital</button></form></details>
+      </article>
+
+      <article class="panel" id="inventory">
+        <div class="table-heading"><div><div class="panel-kicker">STOCK MANAGEMENT</div><h2>Update blood inventory</h2></div><span class="panel-symbol green">✚</span></div>
+        <p class="section-description">Update a hospital's reported units. Always confirm stock with the hospital before directing a patient.</p>
+        <form action="{{ url_for('update_stock') }}" method="POST" class="inventory-form">
+          <label>Hospital<select name="hospital_id" required>{% for hospital in hospitals %}<option value="{{ hospital.id }}">{{ hospital.name }}</option>{% endfor %}</select></label>
+          <div class="two-fields"><label>Blood group<select name="blood_group">{% for group in blood_groups %}<option>{{ group }}</option>{% endfor %}</select></label><label>Available units<input name="units" type="number" min="0" max="10000" value="0" required></label></div>
+          <button class="button button-secondary" type="submit">Save inventory update</button>
+        </form>
+      </article>
+    </section>
+    <footer> <span class="footer-brand">✚ SmartBloodLink</span><span>Prototype for coordination support · Not a substitute for emergency medical services.</span></footer>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
