@@ -172,11 +172,6 @@ def twilio_request_is_valid():
     flat = {k: (v[0] if len(v) == 1 else v) for k, v in params.items()}
     return validator.validate(url, flat, signature)
 
-def hospitals_for_request(blood_request, all_hospitals):
-    """Hospitals in the request city; if none match, fall back to the full network."""
-    matching = [h for h in all_hospitals if h.city.lower() == blood_request.city.lower()]
-    return matching if matching else list(all_hospitals)
-
 def seed_demo_data():
     if Hospital.query.count():
         return
@@ -207,14 +202,10 @@ def index():
         "units": total_units,
     }
     alert_logs = AlertLog.query.order_by(AlertLog.created_at.desc()).limit(12).all()
-    request_alert_targets = {
-        r.id: hospitals_for_request(r, hospitals) for r in requests_list
-    }
     return render_template(
         "index.html",
         hospitals=hospitals,
         requests=requests_list,
-        request_alert_targets=request_alert_targets,
         low_stock=low_stock,
         stats=stats,
         blood_groups=BLOOD_GROUPS,
@@ -315,16 +306,9 @@ def alert_hospitals(request_id):
         flash("Please select a hospital to alert.", "error")
         return redirect(url_for("index"))
 
-    all_hospitals = Hospital.query.order_by(Hospital.name).all()
-    if not all_hospitals:
-        flash("No hospitals have been added yet.", "error")
-        return redirect(url_for("index"))
-
-    eligible = hospitals_for_request(blood_request, all_hospitals)
-    eligible_ids = {h.id for h in eligible}
     hospital = db.session.get(Hospital, hospital_id)
-    if not hospital or hospital.id not in eligible_ids:
-        flash("Choose a hospital in the request’s city (or any hospital if none match that city).", "error")
+    if not hospital:
+        flash("Hospital not found.", "error")
         return redirect(url_for("index"))
 
     _, _, twilio_number = twilio_credentials()
