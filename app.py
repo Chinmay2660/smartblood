@@ -79,11 +79,20 @@ class AlertLog(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     blood_request = db.relationship("BloodRequest", backref="alerts")
 
+def twilio_from_number():
+    """Single outbound Caller ID — all voice calls use TWILIO_PHONE_NUMBER from env."""
+    raw = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+    if not raw:
+        return ""
+    compact = raw.replace(" ", "").replace("-", "")
+    if compact and not compact.startswith("+"):
+        compact = f"+{compact.lstrip('+')}"
+    return compact
+
 def twilio_credentials():
     sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
     token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-    number = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
-    return sid, token, number
+    return sid, token, twilio_from_number()
 
 def twilio_rest_client():
     """Use API key (SK…) if set; otherwise Account SID + primary Auth Token."""
