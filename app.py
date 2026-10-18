@@ -40,6 +40,29 @@ db = SQLAlchemy(app)
 
 BLOOD_GROUPS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
 
+def normalize_phone_e164(phone: str) -> str:
+    """Default India (+91) when users enter a 10-digit local mobile."""
+    raw = phone.strip()
+    if not raw:
+        return ""
+    compact = raw.replace(" ", "").replace("-", "")
+    country = os.getenv("DEFAULT_PHONE_COUNTRY", "91").strip().lstrip("+") or "91"
+    if compact.startswith("+"):
+        digits = "".join(c for c in compact[1:] if c.isdigit())
+        return f"+{digits}" if digits else compact
+    digits = "".join(c for c in compact if c.isdigit())
+    if not digits:
+        return raw
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if len(digits) == 10:
+        return f"+{country}{digits}"
+    if len(digits) == 11 and digits.startswith("0"):
+        return f"+{country}{digits[1:]}"
+    if digits.startswith(country):
+        return f"+{digits}"
+    return f"+{digits}"
+
 class Hospital(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False)
@@ -81,13 +104,7 @@ class AlertLog(db.Model):
 
 def twilio_from_number():
     """Single outbound Caller ID — all voice calls use TWILIO_PHONE_NUMBER from env."""
-    raw = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
-    if not raw:
-        return ""
-    compact = raw.replace(" ", "").replace("-", "")
-    if compact and not compact.startswith("+"):
-        compact = f"+{compact.lstrip('+')}"
-    return compact
+    return normalize_phone_e164(os.getenv("TWILIO_PHONE_NUMBER", "").strip())
 
 def twilio_credentials():
     sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
@@ -250,6 +267,7 @@ def add_hospital():
     city = request.form.get("city", "").strip()
     phone = request.form.get("phone", "").strip()
     email = request.form.get("email", "").strip()
+    phone = normalize_phone_e164(phone)
     if not name or not city or not phone:
         flash("Please enter hospital name, city and phone number.", "error")
         return redirect(url_for("index"))
@@ -307,7 +325,7 @@ def add_request():
     name = request.form.get("patient_name", "").strip()
     group = request.form.get("blood_group", "")
     city = request.form.get("city", "").strip()
-    phone = request.form.get("contact_phone", "").strip()
+    phone = normalize_phone_e164(request.form.get("contact_phone", "").strip())
     urgency = request.form.get("urgency", "Urgent")
     try:
         units = int(request.form.get("units", "1"))
@@ -358,7 +376,11 @@ def alert_hospitals(request_id):
                 blood_request.id, hospital.id, public_url
             )
             call = place_outbound_call(
-                client, hospital.phone, twilio_number, voice_url, public_url
+                client,
+                normalize_phone_e164(hospital.phone),
+                twilio_number,
+                voice_url,
+                public_url,
             )
             if twilio_trial_voice_url():
                 call_details = (
@@ -539,10 +561,27 @@ def ensure_alert_log_columns():
     if additions:
         db.session.commit()
 
+def normalize_stored_phone_numbers():
+    """One-time fixup on boot for numbers saved without +91."""
+    changed = False
+    for hospital in Hospital.query.all():
+        normalized = normalize_phone_e164(hospital.phone)
+        if normalized and normalized != hospital.phone:
+            hospital.phone = normalized
+            changed = True
+    for blood_request in BloodRequest.query.all():
+        normalized = normalize_phone_e164(blood_request.contact_phone)
+        if normalized and normalized != blood_request.contact_phone:
+            blood_request.contact_phone = normalized
+            changed = True
+    if changed:
+        db.session.commit()
+
 with app.app_context():
     db.create_all()
     ensure_alert_log_columns()
     seed_demo_data()
+    normalize_stored_phone_numbers()
 
 if __name__ == "__main__":
     app.run(debug=True)

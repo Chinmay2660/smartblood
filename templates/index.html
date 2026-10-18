@@ -67,7 +67,7 @@
           <label>Units needed<input name="units" type="number" min="1" max="20" value="2" required></label>
           <label>City / area<input name="city" value="Mumbai" required></label>
           <label>Urgency<select name="urgency"><option>Critical</option><option selected>Urgent</option><option>Routine</option></select></label>
-          <label class="full">Contact phone<input name="contact_phone" type="tel" required placeholder="+91 98765 43210"></label>
+          <label class="full">Contact phone<input name="contact_phone" type="tel" required placeholder="9876543210 (+91 added automatically)"></label>
           <button class="button button-primary full" type="submit">Create request <span>→</span></button>
         </form>
         <div class="privacy-note"><span>ⓘ</span> Share only the minimum patient information needed for coordination.</div>
@@ -162,7 +162,7 @@
   </div>
 {% endfor %}
         </div>
-        <details class="inline-details"><summary>＋ Add a hospital</summary><form action="{{ url_for('add_hospital') }}" method="POST" class="compact-form"><input name="name" placeholder="Hospital name" required><input name="city" placeholder="City" required><input name="phone" placeholder="Phone number" required><input name="email" type="email" placeholder="Email (optional)"><button class="button button-primary" type="submit">Add hospital</button></form></details>
+        <details class="inline-details"><summary>＋ Add a hospital</summary><form action="{{ url_for('add_hospital') }}" method="POST" class="compact-form"><input name="name" placeholder="Hospital name" required><input name="city" placeholder="City" required><input name="phone" type="tel" placeholder="9876543210 (+91 added automatically)" required><input name="email" type="email" placeholder="Email (optional)"><button class="button button-primary" type="submit">Add hospital</button></form></details>
       </article>
 
       <article class="panel" id="inventory">
