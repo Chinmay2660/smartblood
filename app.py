@@ -1,5 +1,10 @@
+import base64
+import json
 import os
 import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -204,25 +209,36 @@ def twilio_calls_enabled():
     has_webhooks = bool(public_base_url())
     return bool(sid and (has_api_auth or has_token_auth) and number)
 
-def twilio_call_error_detail(exc):
+def twilio_call_error_detail(exc, to_e164=""):
     """Short, actionable message for alert history (raw Twilio errors are long)."""
     raw = str(exc)
     lower = raw.lower()
+    dest = to_e164 or "this number"
+    india_dest = dest.startswith("+91")
     if "from' number isn't assigned" in lower or "assigned to this verified voice recipient" in lower:
         return (
-            "Twilio trial Voice picks the From number automatically — do not force TWILIO_PHONE_NUMBER "
-            "(redeploy latest app). Re-verify the hospital under Verified Caller IDs. "
-            "US trial accounts can only call verified numbers in the US; +91 requires upgrade or a US test number."
+            "Twilio trial: From/To pairing rejected. Use TWILIO_PHONE_NUMBER that matches your trial "
+            "(or upgrade). For +91 hospitals on a US trial, Voice to India usually requires upgrade."
         )[:255]
-    if "within your country" in lower or "invalid to phone number for trial" in lower:
+    if (
+        india_dest
+        or "within your country" in lower
+        or "invalid to phone number for trial" in lower
+        or "14111" in raw
+    ):
         return (
-            "Twilio trial Voice only allows calls to verified numbers in your account’s country (e.g. US trial → US +1). "
-            "Indian (+91) hospitals need a paid/upgraded account or test with a verified US mobile."
+            f"Twilio trial Voice to {dest}: US trial accounts usually cannot call India (+91), even when "
+            "the number is in Verified Caller IDs. Upgrade Twilio, or test with a verified US +1 number."
         )[:255]
     if "verified recipient" in lower or "trial phone number is assigned" in lower:
+        if india_dest:
+            return (
+                f"{dest} is verified in Console, but US trial Voice often cannot dial +91. Upgrade the account "
+                "or alert a verified US test number."
+            )[:255]
         return (
-            "Twilio trial: this hospital’s number is not a verified recipient. "
-            "In Twilio Console → Phone Numbers → Verified Caller IDs, add it in E.164 (e.g. +91…), then alert again."
+            f"Twilio trial: could not call {dest}. Add the exact E.164 in Verified Caller IDs "
+            "(e.g. +919325427119), matching the hospital record."
         )[:255]
     if "limited parameter access" in lower or "disallowed parameters" in lower:
         hint = (
@@ -242,12 +258,53 @@ def twilio_voice_webhook_ok():
         return True
     return twilio_request_is_valid()
 
+def _twilio_http_auth():
+    account_sid, auth_token, _ = twilio_credentials()
+    api_key = os.getenv("TWILIO_API_KEY_SID", "").strip()
+    api_secret = os.getenv("TWILIO_API_KEY_SECRET", "").strip()
+    if api_key and api_secret:
+        return account_sid, (api_key, api_secret)
+    return account_sid, (account_sid, auth_token)
+
+def _trial_call_create_without_from(to, **kwargs):
+    """Voice trial API allows To + Url/Twiml without From; Python SDK does not."""
+    account_sid, auth = _twilio_http_auth()
+    form = [("To", to)]
+    if kwargs.get("url"):
+        form.append(("Url", kwargs["url"]))
+    if kwargs.get("twiml"):
+        form.append(("Twiml", kwargs["twiml"]))
+    body = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls.json",
+        data=body,
+        method="POST",
+    )
+    token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+    req.add_header("Authorization", f"Basic {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode(errors="replace")
+        raise RuntimeError(err_body or str(exc)) from exc
+    sid = payload.get("sid", "")
+    return type("TwilioCall", (), {"sid": sid})()
+
 def create_outbound_call(client, to, from_, **kwargs):
-    """Twilio Python SDK requires from_; must match trial verified-recipient pairing."""
     from_num = (from_ or twilio_from_number()).strip()
-    if not from_num:
-        raise RuntimeError("Set TWILIO_PHONE_NUMBER to your Twilio voice number in E.164 format.")
-    return client.calls.create(to=to, from_=from_num, **kwargs)
+    if twilio_use_production_voice():
+        if not from_num:
+            raise RuntimeError("Set TWILIO_PHONE_NUMBER to your Twilio voice number in E.164 format.")
+        return client.calls.create(to=to, from_=from_num, **kwargs)
+    try:
+        return _trial_call_create_without_from(to, **kwargs)
+    except Exception:
+        if not from_num:
+            raise RuntimeError(
+                "Trial outbound failed. Set TWILIO_PHONE_NUMBER to your Twilio or verified Caller ID, or upgrade."
+            )
+        return client.calls.create(to=to, from_=from_num, **kwargs)
 
 def place_trial_script_call(client, to, from_, public_url, request_id, hospital_id, twiml_body):
     """Blood-request audio without the full /voice keypad flow (works on Twilio trial)."""
@@ -464,13 +521,14 @@ def alert_hospitals(request_id):
     called = False
 
     if real_calls_enabled and hospital.verified:
+        to_phone = normalize_phone_e164(hospital.phone)
         try:
             client = twilio_rest_client()
             if twilio_trial_script_enabled():
                 twiml_body = build_trial_alert_twiml(blood_request, hospital)
                 call, delivery = place_trial_script_call(
                     client,
-                    normalize_phone_e164(hospital.phone),
+                    to_phone,
                     twilio_number,
                     public_url,
                     blood_request.id,
@@ -493,7 +551,7 @@ def alert_hospitals(request_id):
                 )
                 call = place_outbound_call(
                     client,
-                    normalize_phone_e164(hospital.phone),
+                    to_phone,
                     twilio_number,
                     voice_url,
                     public_url,
@@ -520,7 +578,7 @@ def alert_hospitals(request_id):
             ))
             called = True
         except Exception as exc:
-            detail = twilio_call_error_detail(exc)
+            detail = twilio_call_error_detail(exc, to_e164=to_phone)
             db.session.add(
                 AlertLog(
                     request_id=blood_request.id,
