@@ -202,6 +202,17 @@ def twilio_call_error_detail(exc):
     """Short, actionable message for alert history (raw Twilio errors are long)."""
     raw = str(exc)
     lower = raw.lower()
+    if "from' number isn't assigned" in lower or "assigned to this verified voice recipient" in lower:
+        return (
+            "Twilio trial Voice picks the From number automatically — do not force TWILIO_PHONE_NUMBER "
+            "(redeploy latest app). Re-verify the hospital under Verified Caller IDs. "
+            "US trial accounts can only call verified numbers in the US; +91 requires upgrade or a US test number."
+        )[:255]
+    if "within your country" in lower or "invalid to phone number for trial" in lower:
+        return (
+            "Twilio trial Voice only allows calls to verified numbers in your account’s country (e.g. US trial → US +1). "
+            "Indian (+91) hospitals need a paid/upgraded account or test with a verified US mobile."
+        )[:255]
     if "verified recipient" in lower or "trial phone number is assigned" in lower:
         return (
             "Twilio trial: this hospital’s number is not a verified recipient. "
@@ -224,15 +235,30 @@ def twilio_voice_webhook_ok():
         return True
     return twilio_request_is_valid()
 
+def create_outbound_call(client, to, from_, **kwargs):
+    """Trial Voice assigns its own From per verified recipient — passing From causes 403."""
+    if twilio_use_production_voice():
+        return client.calls.create(to=to, from_=from_, **kwargs)
+    try:
+        return client.calls.create(to=to, **kwargs)
+    except Exception as exc:
+        lower = str(exc).lower()
+        if from_ and (
+            "assigned to this verified voice recipient" in lower
+            or "assigned trial number" in lower
+        ):
+            return client.calls.create(to=to, **kwargs)
+        raise
+
 def place_trial_script_call(client, to, from_, public_url, request_id, hospital_id, twiml_body):
     """Blood-request audio without the full /voice keypad flow (works on Twilio trial)."""
     attempts = [
-        ("inline_twiml", lambda: client.calls.create(to=to, from_=from_, twiml=twiml_body)),
+        ("inline_twiml", lambda: create_outbound_call(client, to, from_, twiml=twiml_body)),
     ]
     if public_url:
         trial_url = trial_voice_webhook_url(request_id, hospital_id, public_url)
         attempts.append(
-            ("app_webhook", lambda: client.calls.create(to=to, from_=from_, url=trial_url))
+            ("app_webhook", lambda: create_outbound_call(client, to, from_, url=trial_url))
         )
     errors = []
     for label, create in attempts:
@@ -249,19 +275,18 @@ def place_trial_script_call(client, to, from_, public_url, request_id, hospital_
 def place_outbound_call(client, to, from_, voice_url, public_url, twiml=None):
     """Trial accounts reject extra Call.create params."""
     if twiml:
-        return client.calls.create(to=to, from_=from_, twiml=twiml)
-    minimal = {"to": to, "from_": from_, "url": voice_url}
+        return create_outbound_call(client, to, from_, twiml=twiml)
     if voice_url.startswith("https://webhooks.twilio.com/"):
-        return client.calls.create(**minimal)
-    # ponytail: trial usually fails on status_callback — try minimal first, then full webhook on paid accounts
+        return create_outbound_call(client, to, from_, url=voice_url)
     try:
-        return client.calls.create(**minimal)
+        return create_outbound_call(client, to, from_, url=voice_url)
     except Exception as exc:
         msg = str(exc).lower()
         if "limited parameter access" not in msg and "disallowed parameters" not in msg:
             raise
-        with_status = {**minimal, "status_callback": f"{public_url}/call-status"}
-        return client.calls.create(**with_status)
+        return create_outbound_call(
+            client, to, from_, url=voice_url, status_callback=f"{public_url}/call-status"
+        )
 
 def twilio_request_is_valid():
     """Validate X-Twilio-Signature when Auth Token is configured."""
@@ -639,6 +664,23 @@ def api_summary():
         "open_requests": BloodRequest.query.filter_by(status="Open").count(),
         "low_stock": BloodStock.query.filter(BloodStock.units <= 2).count(),
         "total_units": db.session.query(db.func.sum(BloodStock.units)).scalar() or 0
+    })
+
+@app.route("/api/twilio-status")
+def api_twilio_status():
+    """Debug deployed Twilio voice settings (no secrets)."""
+    from_num = twilio_from_number()
+    tail = from_num[-4:] if len(from_num) >= 4 else ""
+    return jsonify({
+        "calls_configured": twilio_calls_enabled(),
+        "trial_script": should_use_trial_script(),
+        "production_voice": twilio_use_production_voice(),
+        "configured_from_last4": tail,
+        "sends_from_on_trial": False,
+        "public_base_host": (public_base_url() or "").replace("https://", "").split("/")[0],
+        "trial_note": (
+            "Trial Voice omits From (Twilio assigns it). US trial cannot call +91 — upgrade for India."
+        ),
     })
 
 def ensure_alert_log_columns():
