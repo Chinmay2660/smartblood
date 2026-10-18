@@ -137,17 +137,24 @@ TWILIO_TRIAL_VOICE_TEMPLATE = (
 def twilio_use_trial_voice_flag():
     return os.getenv("TWILIO_USE_TRIAL_VOICE", "").strip().lower() in ("1", "true", "yes")
 
-def twilio_trial_script_enabled():
-    """Inline TwiML blood-request message (default when TWILIO_USE_TRIAL_VOICE=1)."""
-    if not twilio_use_trial_voice_flag():
+def twilio_use_production_voice():
+    """Full /voice webhook with press 1/2 — requires paid Twilio + working HTTPS webhooks."""
+    return os.getenv("TWILIO_VOICE_MODE", "").strip().lower() in ("production", "full", "paid")
+
+def should_use_trial_script():
+    """Default on Vercel/trial unless TWILIO_VOICE_MODE=production (avoids broken /voice URL fetches)."""
+    if twilio_use_production_voice():
         return False
     script_flag = os.getenv("TWILIO_TRIAL_SCRIPT", "").strip().lower()
     if script_flag in ("0", "false", "no"):
         return False
     explicit_url = os.getenv("TWILIO_TRIAL_VOICE_URL", "").strip()
-    if explicit_url and script_flag not in ("1", "true", "yes"):
+    if explicit_url and script_flag not in ("1", "true", "yes") and not twilio_use_trial_voice_flag():
         return False
     return True
+
+def twilio_trial_script_enabled():
+    return should_use_trial_script()
 
 def twilio_trial_voice_url():
     """Twilio-hosted demo URL when trial mode is on but inline script is off."""
@@ -189,10 +196,7 @@ def twilio_calls_enabled():
     has_api_auth = bool(api_key and api_secret)
     has_token_auth = bool(token)
     has_webhooks = bool(public_base_url())
-    has_trial = twilio_use_trial_voice_flag()
-    return bool(
-        sid and (has_api_auth or has_token_auth) and number and (has_webhooks or has_trial)
-    )
+    return bool(sid and (has_api_auth or has_token_auth) and number)
 
 def twilio_call_error_detail(exc):
     """Short, actionable message for alert history (raw Twilio errors are long)."""
@@ -216,25 +220,20 @@ def twilio_call_error_detail(exc):
     return raw[:255]
 
 def twilio_voice_webhook_ok():
-    if twilio_request_is_valid():
+    if request.path.startswith("/voice/trial/"):
         return True
-    # ponytail: trial voice fetches often fail signature match behind Vercel; still serve TwiML for /voice/trial only
-    return bool(
-        twilio_use_trial_voice_flag() and request.path.startswith("/voice/trial/")
-    )
+    return twilio_request_is_valid()
 
 def place_trial_script_call(client, to, from_, public_url, request_id, hospital_id, twiml_body):
-    """Trial-safe blood-request audio: app webhook first, then inline TwiML (never the generic demo template)."""
-    if not public_url:
-        raise RuntimeError(
-            "PUBLIC_BASE_URL is required for the trial blood-request script. "
-            "Set it to your Vercel URL (e.g. https://smartblood-beta.vercel.app)."
-        )
-    trial_url = trial_voice_webhook_url(request_id, hospital_id, public_url)
-    attempts = (
-        ("app_webhook", lambda: client.calls.create(to=to, from_=from_, url=trial_url)),
+    """Blood-request audio without the full /voice keypad flow (works on Twilio trial)."""
+    attempts = [
         ("inline_twiml", lambda: client.calls.create(to=to, from_=from_, twiml=twiml_body)),
-    )
+    ]
+    if public_url:
+        trial_url = trial_voice_webhook_url(request_id, hospital_id, public_url)
+        attempts.append(
+            ("app_webhook", lambda: client.calls.create(to=to, from_=from_, url=trial_url))
+        )
     errors = []
     for label, create in attempts:
         try:
@@ -281,8 +280,11 @@ def twilio_request_is_valid():
         url = f"{callback_url}{path}"
     else:
         url = request.url
-    params = request.form.to_dict(flat=False)
-    flat = {k: (v[0] if len(v) == 1 else v) for k, v in params.items()}
+    if request.method == "GET":
+        flat = request.args.to_dict(flat=True)
+    else:
+        params = request.form.to_dict(flat=False)
+        flat = {k: (v[0] if len(v) == 1 else v) for k, v in params.items()}
     return validator.validate(url, flat, signature)
 
 def seed_demo_data():
@@ -324,8 +326,8 @@ def index():
         blood_groups=BLOOD_GROUPS,
         alert_logs=alert_logs,
         real_calls_enabled=twilio_calls_enabled(),
-        trial_voice_mode=twilio_use_trial_voice_flag(),
-        trial_script_mode=twilio_trial_script_enabled(),
+        trial_voice_mode=twilio_use_trial_voice_flag() and not should_use_trial_script(),
+        trial_script_mode=should_use_trial_script(),
     )
 
 @app.route("/hospital/add", methods=["POST"])
@@ -479,7 +481,10 @@ def alert_hospitals(request_id):
                         "Set TWILIO_TRIAL_SCRIPT=1 and redeploy for the blood-request message."
                     )
                 else:
-                    call_details = "Awaiting hospital response"
+                    call_details = (
+                        "Production voice — awaiting keypad response (requires TWILIO_VOICE_MODE=production "
+                        "and working /voice webhooks)."
+                    )
             db.session.add(AlertLog(
                 request_id=blood_request.id,
                 hospital_id=hospital.id,
