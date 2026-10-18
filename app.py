@@ -166,10 +166,16 @@ def twilio_trial_voice_url():
     return TWILIO_TRIAL_VOICE_TEMPLATE
 
 def twilio_outbound_voice_url(request_id, hospital_id, public_url):
+    if should_use_trial_script() and public_url:
+        return trial_voice_webhook_url(request_id, hospital_id, public_url)
     trial = twilio_trial_voice_url()
     if trial:
         return trial
     return f"{public_url}/voice/{request_id}/{hospital_id}"
+
+def voice_xml_response(twiml_body):
+    from flask import Response
+    return Response(twiml_body, mimetype="text/xml; charset=utf-8")
 
 def blood_request_voice_intro(blood_request, hospital, include_keypad=True):
     intro = (
@@ -231,7 +237,8 @@ def twilio_call_error_detail(exc):
     return raw[:255]
 
 def twilio_voice_webhook_ok():
-    if request.path.startswith("/voice/trial/"):
+    # ponytail: Vercel + trial Voice — signature URL often mismatches; Reject → “check your URL” on the call
+    if request.path.startswith("/voice/") and not twilio_use_production_voice():
         return True
     return twilio_request_is_valid()
 
@@ -252,14 +259,15 @@ def create_outbound_call(client, to, from_, **kwargs):
 
 def place_trial_script_call(client, to, from_, public_url, request_id, hospital_id, twiml_body):
     """Blood-request audio without the full /voice keypad flow (works on Twilio trial)."""
-    attempts = [
-        ("inline_twiml", lambda: create_outbound_call(client, to, from_, twiml=twiml_body)),
-    ]
+    attempts = []
     if public_url:
         trial_url = trial_voice_webhook_url(request_id, hospital_id, public_url)
         attempts.append(
             ("app_webhook", lambda: create_outbound_call(client, to, from_, url=trial_url))
         )
+    attempts.append(
+        ("inline_twiml", lambda: create_outbound_call(client, to, from_, twiml=twiml_body))
+    )
     errors = []
     for label, create in attempts:
         try:
@@ -572,28 +580,29 @@ def alert_hospitals(request_id):
 
 @app.route("/voice/trial/<int:request_id>/<int:hospital_id>", methods=["GET", "POST"])
 def voice_trial_script(request_id, hospital_id):
-    from flask import Response
     if not twilio_voice_webhook_ok():
-        return Response("<Response><Reject/></Response>", mimetype="text/xml", status=403)
+        return voice_xml_response("<Response><Reject/></Response>")
     blood_request = db.session.get(BloodRequest, request_id)
     hospital = db.session.get(Hospital, hospital_id)
     if not blood_request or not hospital:
-        return Response("<Response><Say>Request not found. Goodbye.</Say></Response>", mimetype="text/xml")
-    return Response(
-        build_trial_alert_twiml(blood_request, hospital),
-        mimetype="text/xml",
-    )
+        return voice_xml_response(
+            "<Response><Say voice=\"alice\">Smart BloodLink request not found. Goodbye.</Say></Response>"
+        )
+    return voice_xml_response(build_trial_alert_twiml(blood_request, hospital))
 
 @app.route("/voice/<int:request_id>/<int:hospital_id>", methods=["GET", "POST"])
 def voice_prompt(request_id, hospital_id):
-    from flask import Response
     from xml.sax.saxutils import escape
-    if not twilio_request_is_valid():
-        return Response("<Response><Reject/></Response>", mimetype="text/xml", status=403)
+    if not twilio_voice_webhook_ok():
+        return voice_xml_response("<Response><Reject/></Response>")
     blood_request = db.session.get(BloodRequest, request_id)
     hospital = db.session.get(Hospital, hospital_id)
     if not blood_request or not hospital:
-        return Response("<Response><Say>Request not found. Goodbye.</Say></Response>", mimetype="text/xml")
+        return voice_xml_response(
+            "<Response><Say voice=\"alice\">Request not found. Goodbye.</Say></Response>"
+        )
+    if not twilio_use_production_voice():
+        return voice_xml_response(build_trial_alert_twiml(blood_request, hospital))
     base = public_base_url()
     respond_url = f"{base}/voice/{request_id}/{hospital_id}/respond"
     intro = blood_request_voice_intro(blood_request, hospital, include_keypad=True)
@@ -605,14 +614,13 @@ def voice_prompt(request_id, hospital_id):
         "<Say>We did not receive a response. Please call the requesting hospital directly. Goodbye.</Say>"
         "</Response>"
     )
-    return Response(xml, mimetype="text/xml")
+    return voice_xml_response(xml)
 
 @app.route("/voice/<int:request_id>/<int:hospital_id>/respond", methods=["POST"])
 def voice_respond(request_id, hospital_id):
-    from flask import Response
     from xml.sax.saxutils import escape
-    if not twilio_request_is_valid():
-        return Response("<Response><Reject/></Response>", mimetype="text/xml", status=403)
+    if not twilio_voice_webhook_ok():
+        return voice_xml_response("<Response><Reject/></Response>")
     digit = request.form.get("Digits", "")
     call_sid = request.form.get("CallSid", "")
     blood_request = db.session.get(BloodRequest, request_id)
@@ -642,7 +650,14 @@ def voice_respond(request_id, hospital_id):
     if log:
         db.session.commit()
     xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">{escape(reply)}</Say></Response>'
-    return Response(xml, mimetype="text/xml")
+    return voice_xml_response(xml)
+
+@app.route("/voice/health", methods=["GET", "POST"])
+def voice_health():
+    """Twilio can hit this to confirm voice webhooks return valid TwiML."""
+    return voice_xml_response(
+        '<Response><Say voice="alice">Smart BloodLink voice webhooks are working.</Say></Response>'
+    )
 
 @app.route("/call-status", methods=["POST"])
 def call_status():
